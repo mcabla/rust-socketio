@@ -274,7 +274,7 @@ impl RawClient {
                         // Return Ok(None) to signal the end of the iterator
                         return Ok(None);
                     } else {
-                        self.callback(&Event::Error, err.to_string())?;
+                        self.callback(&Event::Error, err.to_string(), None)?;
                         return Err(err);
                     }
                 }

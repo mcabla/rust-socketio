@@ -169,7 +169,11 @@ impl RawClient {
         let _ = self.socket.send(disconnect_packet);
         self.socket.disconnect()?;
 
-        let _ = self.callback(&Event::Close, CloseReason::IOClientDisconnect.as_str()); // trigger on_close
+        let _ = self.callback(
+            &Event::Close,
+            CloseReason::IOClientDisconnect.as_str(),
+            None,
+        ); // trigger on_close
         Ok(())
     }
 
@@ -245,6 +249,14 @@ impl RawClient {
         Ok(())
     }
 
+    pub fn ack<D>(&self, ack_id: i32, data: D) -> Result<()>
+    where
+        D: Into<Payload>,
+    {
+        let socket_packet = Packet::new_ack(data.into(), &self.nsp, ack_id);
+        self.socket.send(socket_packet)
+    }
+
     pub(crate) fn poll(&self) -> Result<Option<Packet>> {
         {
             let disconnect_reason = *self.disconnect_reason.read()?;
@@ -284,7 +296,12 @@ impl RawClient {
         Iter { socket: self }
     }
 
-    fn callback<P: Into<Payload>>(&self, event: &Event, payload: P) -> Result<()> {
+    fn callback<P: Into<Payload>>(
+        &self,
+        event: &Event,
+        payload: P,
+        ack_id: Option<i32>,
+    ) -> Result<()> {
         let mut on = self.on.lock()?;
         let mut on_any = self.on_any.lock()?;
         let lock = on.deref_mut();
@@ -293,12 +310,12 @@ impl RawClient {
         let payload = payload.into();
 
         if let Some(callback) = lock.get_mut(event) {
-            callback(payload.clone(), self.clone());
+            callback(payload.clone(), self.clone(), ack_id);
         }
         match event {
             Event::Message | Event::Custom(_) => {
                 if let Some(callback) = on_any_lock {
-                    callback(event.clone(), payload, self.clone())
+                    callback(event.clone(), payload, self.clone(), ack_id)
                 }
             }
             _ => {}
@@ -329,12 +346,16 @@ impl RawClient {
         if let Some(mut ack) = outstanding_ack {
             if ack.time_started.elapsed() < ack.timeout {
                 if let Some(ref payload) = socket_packet.data {
-                    ack.callback.deref_mut()(Payload::from(payload.to_owned()), self.clone());
+                    ack.callback.deref_mut()(Payload::from(payload.to_owned()), self.clone(), None);
                 }
 
                 if let Some(ref attachments) = socket_packet.attachments {
                     if let Some(payload) = attachments.first() {
-                        ack.callback.deref_mut()(Payload::Binary(payload.to_owned()), self.clone());
+                        ack.callback.deref_mut()(
+                            Payload::Binary(payload.to_owned()),
+                            self.clone(),
+                            None,
+                        );
                     }
                 }
             }
@@ -354,7 +375,11 @@ impl RawClient {
 
         if let Some(attachments) = &packet.attachments {
             if let Some(binary_payload) = attachments.first() {
-                self.callback(&event, Payload::Binary(binary_payload.to_owned()))?;
+                self.callback(
+                    &event,
+                    Payload::Binary(binary_payload.to_owned()),
+                    packet.id,
+                )?;
             }
         }
         Ok(())
@@ -386,7 +411,7 @@ impl RawClient {
             };
 
             // call the correct callback
-            self.callback(&event, payloads.to_vec())?;
+            self.callback(&event, payloads.to_vec(), packet.id)?;
         }
 
         Ok(())
@@ -401,22 +426,26 @@ impl RawClient {
             match packet.packet_type {
                 PacketId::Ack | PacketId::BinaryAck => {
                     if let Err(err) = self.handle_ack(packet) {
-                        self.callback(&Event::Error, err.to_string())?;
+                        self.callback(&Event::Error, err.to_string(), None)?;
                         return Err(err);
                     }
                 }
                 PacketId::BinaryEvent => {
                     if let Err(err) = self.handle_binary_event(packet) {
-                        self.callback(&Event::Error, err.to_string())?;
+                        self.callback(&Event::Error, err.to_string(), None)?;
                     }
                 }
                 PacketId::Connect => {
                     *(self.disconnect_reason.write()?) = DisconnectReason::default();
-                    self.callback(&Event::Connect, "")?;
+                    self.callback(&Event::Connect, "", None)?;
                 }
                 PacketId::Disconnect => {
                     *(self.disconnect_reason.write()?) = DisconnectReason::Server;
-                    self.callback(&Event::Close, CloseReason::IOServerDisconnect.as_str())?;
+                    self.callback(
+                        &Event::Close,
+                        CloseReason::IOServerDisconnect.as_str(),
+                        None,
+                    )?;
                 }
                 PacketId::ConnectError => {
                     self.callback(
@@ -426,11 +455,12 @@ impl RawClient {
                                 .clone()
                                 .data
                                 .unwrap_or_else(|| String::from("\"No error message provided\"")),
+                        None,
                     )?;
                 }
                 PacketId::Event => {
                     if let Err(err) = self.handle_event(packet) {
-                        self.callback(&Event::Error, err.to_string())?;
+                        self.callback(&Event::Error, err.to_string(), None)?;
                     }
                 }
             }

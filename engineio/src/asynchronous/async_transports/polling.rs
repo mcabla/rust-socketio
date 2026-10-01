@@ -8,13 +8,29 @@ use http::HeaderMap;
 use native_tls::TlsConnector;
 use reqwest::{Client, ClientBuilder, Response};
 use std::fmt::Debug;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 use std::{pin::Pin, sync::Arc};
 use tokio::sync::RwLock;
 use url::Url;
 
 use crate::asynchronous::generator::StreamGenerator;
 use crate::{asynchronous::transport::AsyncTransport, error::Result, Error};
+
+/// Longest a long-poll GET may stay open; the server answers well within its
+/// ping interval, so a longer wait means the connection is dead.
+const POLL_TIMEOUT: Duration = Duration::from_secs(75);
+/// Longest a POST may take. Sends are serialized (including the pong), so one
+/// hung POST would otherwise block the connection forever.
+const POST_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Without timeouts a request on a silently dropped connection never finishes,
+/// and idle pooled connections may be reused after the server closed them.
+fn configured(builder: ClientBuilder) -> ClientBuilder {
+    builder
+        .connect_timeout(Duration::from_secs(10))
+        .pool_idle_timeout(Duration::from_secs(2))
+        .tcp_keepalive(Duration::from_secs(15))
+}
 
 /// An asynchronous polling type. Makes use of the nonblocking reqwest types and
 /// methods.
@@ -32,17 +48,20 @@ impl PollingTransport {
         opening_headers: Option<HeaderMap>,
     ) -> Self {
         let client = match (tls_config, opening_headers) {
-            (Some(config), Some(map)) => ClientBuilder::new()
+            (Some(config), Some(map)) => configured(ClientBuilder::new())
                 .use_preconfigured_tls(config)
                 .default_headers(map)
                 .build()
                 .unwrap(),
-            (Some(config), None) => ClientBuilder::new()
+            (Some(config), None) => configured(ClientBuilder::new())
                 .use_preconfigured_tls(config)
                 .build()
                 .unwrap(),
-            (None, Some(map)) => ClientBuilder::new().default_headers(map).build().unwrap(),
-            (None, None) => Client::new(),
+            (None, Some(map)) => configured(ClientBuilder::new())
+                .default_headers(map)
+                .build()
+                .unwrap(),
+            (None, None) => configured(ClientBuilder::new()).build().unwrap(),
         };
 
         let mut url = base_url;
@@ -68,6 +87,7 @@ impl PollingTransport {
 
             yield client
                 .get(address?)
+                .timeout(POLL_TIMEOUT)
                 .send().await?
         }
     }
@@ -115,14 +135,21 @@ impl AsyncTransport for PollingTransport {
             data
         };
 
-        let status = self
-            .client
-            .post(self.address().await?)
-            .body(data_to_send)
-            .send()
-            .await?
-            .status()
-            .as_u16();
+        let address = self.address().await?;
+        let post = || {
+            self.client
+                .post(address.clone())
+                .timeout(POST_TIMEOUT)
+                .body(data_to_send.clone())
+        };
+        // A failed connect never reached the server, so one retry cannot
+        // deliver the packet twice.
+        let response = match post().send().await {
+            Ok(response) => response,
+            Err(error) if error.is_connect() => post().send().await?,
+            Err(error) => return Err(error.into()),
+        };
+        let status = response.status().as_u16();
 
         if status != 200 {
             let error = Error::IncompleteHttp(status);

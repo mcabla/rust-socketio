@@ -7,10 +7,11 @@ use futures_util::{Stream, StreamExt};
 use http::HeaderMap;
 use native_tls::TlsConnector;
 use reqwest::{Client, ClientBuilder, Response};
+use std::collections::VecDeque;
 use std::fmt::Debug;
 use std::time::{Duration, SystemTime};
 use std::{pin::Pin, sync::Arc};
-use tokio::sync::RwLock;
+use tokio::sync::{oneshot, RwLock};
 use url::Url;
 
 use crate::asynchronous::generator::StreamGenerator;
@@ -22,6 +23,22 @@ const POLL_TIMEOUT: Duration = Duration::from_secs(75);
 /// Longest a POST may take. Sends are serialized (including the pong), so one
 /// hung POST would otherwise block the connection forever.
 const POST_TIMEOUT: Duration = Duration::from_secs(20);
+/// Batches stay below the server's default maxHttpBufferSize (1e6 bytes).
+const MAX_BATCH_BYTES: usize = 900_000;
+/// Engine.IO v4 separates the packets of one HTTP payload with this byte.
+const PAYLOAD_SEPARATOR: u8 = 0x1e;
+
+type SendResult = std::result::Result<(), String>;
+
+/// Packets waiting for the single writer, as the JS client's writeBuffer: while
+/// one POST is in flight new packets (such as the pong) queue up, and the next
+/// POST carries all of them. One packet per round trip, as before, let a pong
+/// wait behind every queued message.
+#[derive(Default)]
+struct WriteQueue {
+    pending: VecDeque<(Bytes, oneshot::Sender<SendResult>)>,
+    writing: bool,
+}
 
 /// Without timeouts a request on a silently dropped connection never finishes,
 /// and idle pooled connections may be reused after the server closed them.
@@ -39,6 +56,7 @@ pub struct PollingTransport {
     client: Client,
     base_url: Arc<RwLock<Url>>,
     generator: StreamGenerator<Bytes>,
+    queue: Arc<std::sync::Mutex<WriteQueue>>,
 }
 
 impl PollingTransport {
@@ -71,7 +89,90 @@ impl PollingTransport {
             client: client.clone(),
             base_url: Arc::new(RwLock::new(url.clone())),
             generator: StreamGenerator::new(Self::stream(url, client)),
+            queue: Arc::new(std::sync::Mutex::new(WriteQueue::default())),
         }
+    }
+
+    /// Queues one encoded packet without waiting; the returned receiver yields
+    /// the outcome of the POST that carried it. Callers enqueue in send order.
+    pub(crate) fn enqueue(&self, data: Bytes, is_binary_att: bool) -> oneshot::Receiver<SendResult> {
+        let segment = if is_binary_att {
+            // the binary attachment gets `base64` encoded
+            let mut packet_bytes = BytesMut::with_capacity(data.len() + 1);
+            packet_bytes.put_u8(b'b');
+            let encoded_data = general_purpose::STANDARD.encode(data);
+            packet_bytes.put(encoded_data.as_bytes());
+            packet_bytes.freeze()
+        } else {
+            data
+        };
+        let (sender, receiver) = oneshot::channel();
+        let start_writer = {
+            let mut queue = self.queue.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            queue.pending.push_back((segment, sender));
+            !std::mem::replace(&mut queue.writing, true)
+        };
+        if start_writer {
+            let transport = self.clone();
+            tokio::spawn(async move { transport.write_loop().await });
+        }
+        receiver
+    }
+
+    /// Sends queued packets, each POST carrying everything that is waiting.
+    async fn write_loop(self) {
+        loop {
+            let batch = {
+                let mut queue = self.queue.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                if queue.pending.is_empty() {
+                    queue.writing = false;
+                    return;
+                }
+                let mut size = 0;
+                let mut batch = Vec::new();
+                while let Some((segment, _)) = queue.pending.front() {
+                    if !batch.is_empty() && size + 1 + segment.len() > MAX_BATCH_BYTES {
+                        break;
+                    }
+                    size += segment.len() + usize::from(!batch.is_empty());
+                    batch.push(queue.pending.pop_front().expect("front exists"));
+                }
+                batch
+            };
+            let mut body = BytesMut::with_capacity(batch.iter().map(|(segment, _)| segment.len() + 1).sum());
+            for (index, (segment, _)) in batch.iter().enumerate() {
+                if index > 0 {
+                    body.put_u8(PAYLOAD_SEPARATOR);
+                }
+                body.put(segment.clone());
+            }
+            let result = self.post(body.freeze()).await.map_err(|error| error.to_string());
+            for (_, sender) in batch {
+                let _ = sender.send(result.clone());
+            }
+        }
+    }
+
+    async fn post(&self, body: Bytes) -> Result<()> {
+        let address = self.address().await?;
+        let post = || {
+            self.client
+                .post(address.clone())
+                .timeout(POST_TIMEOUT)
+                .body(body.clone())
+        };
+        // A failed connect never reached the server, so one retry cannot
+        // deliver the packets twice.
+        let response = match post().send().await {
+            Ok(response) => response,
+            Err(error) if error.is_connect() => post().send().await?,
+            Err(error) => return Err(error.into()),
+        };
+        let status = response.status().as_u16();
+        if status != 200 {
+            return Err(Error::IncompleteHttp(status));
+        }
+        Ok(())
     }
 
     fn address(mut url: Url) -> Result<Url> {
@@ -122,41 +223,10 @@ impl Stream for PollingTransport {
 #[async_trait]
 impl AsyncTransport for PollingTransport {
     async fn emit(&self, data: Bytes, is_binary_att: bool) -> Result<()> {
-        let data_to_send = if is_binary_att {
-            // the binary attachment gets `base64` encoded
-            let mut packet_bytes = BytesMut::with_capacity(data.len() + 1);
-            packet_bytes.put_u8(b'b');
-
-            let encoded_data = general_purpose::STANDARD.encode(data);
-            packet_bytes.put(encoded_data.as_bytes());
-
-            packet_bytes.freeze()
-        } else {
-            data
-        };
-
-        let address = self.address().await?;
-        let post = || {
-            self.client
-                .post(address.clone())
-                .timeout(POST_TIMEOUT)
-                .body(data_to_send.clone())
-        };
-        // A failed connect never reached the server, so one retry cannot
-        // deliver the packet twice.
-        let response = match post().send().await {
-            Ok(response) => response,
-            Err(error) if error.is_connect() => post().send().await?,
-            Err(error) => return Err(error.into()),
-        };
-        let status = response.status().as_u16();
-
-        if status != 200 {
-            let error = Error::IncompleteHttp(status);
-            return Err(error);
-        }
-
-        Ok(())
+        self.enqueue(data, is_binary_att)
+            .await
+            .map_err(|_| Error::PollingSendFailed("polling writer stopped".to_string()))?
+            .map_err(Error::PollingSendFailed)
     }
 
     async fn base_url(&self) -> Result<Url> {

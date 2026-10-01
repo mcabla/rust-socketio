@@ -176,9 +176,20 @@ impl Socket {
         };
 
         let lock = self.transport.lock().await;
-        let fut = lock.as_transport().emit(data, is_binary);
+        let result = if let AsyncTransportType::Polling(polling) = &*lock {
+            // Queue in send order under the lock, then wait without holding it,
+            // so packets sent meanwhile (the pong) join the next POST.
+            let pending = polling.enqueue(data, is_binary);
+            drop(lock);
+            pending
+                .await
+                .map_err(|_| Error::PollingSendFailed("polling writer stopped".to_string()))
+                .and_then(|result| result.map_err(Error::PollingSendFailed))
+        } else {
+            lock.as_transport().emit(data, is_binary).await
+        };
 
-        if let Err(error) = fut.await {
+        if let Err(error) = result {
             self.call_error_callback(error.to_string());
             return Err(error);
         }
@@ -261,11 +272,20 @@ impl Socket {
                     Ok(result) => result.map(|result| (result, stream)),
                     // We didn't receive a ping in time and now consider the connection as closed.
                     Err(_) => {
-                        // Be nice and disconnect properly.
-                        if let Err(e) = self.disconnect().await {
-                            Some((Err(e), stream))
-                        } else {
-                            Some((Err(Error::PingTimeout()), stream))
+                        // Be nice and disconnect properly, but never wait long: on a
+                        // dead connection the close packet cannot be delivered either
+                        // (the JS client simply closes the transport here).
+                        match tokio::time::timeout(
+                            std::time::Duration::from_secs(2),
+                            self.disconnect(),
+                        )
+                        .await
+                        {
+                            Ok(Err(e)) => Some((Err(e), stream)),
+                            _ => {
+                                self.connected.store(false, Ordering::Release);
+                                Some((Err(Error::PingTimeout()), stream))
+                            }
                         }
                     }
                 }

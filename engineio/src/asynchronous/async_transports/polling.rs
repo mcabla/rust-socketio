@@ -20,11 +20,14 @@ use crate::{asynchronous::transport::AsyncTransport, error::Result, Error};
 /// Longest a long-poll GET may stay open; the server answers well within its
 /// ping interval, so a longer wait means the connection is dead.
 const POLL_TIMEOUT: Duration = Duration::from_secs(75);
-/// Longest a POST may take. Sends are serialized (including the pong), so one
-/// hung POST would otherwise block the connection forever.
+/// Longest a small POST may take. Sends are serialized (including the pong),
+/// so one hung POST would otherwise block the connection forever.
 const POST_TIMEOUT: Duration = Duration::from_secs(20);
-/// Batches stay below the server's default maxHttpBufferSize (1e6 bytes).
-const MAX_BATCH_BYTES: usize = 900_000;
+/// Extra time per byte for large POSTs on a slow uplink (25 kB/s worst case).
+const POST_BYTES_PER_EXTRA_SECOND: usize = 25_000;
+/// Smaller batches keep each POST short, so a pong queued behind one waits
+/// little; well below the server's default maxHttpBufferSize (1e6 bytes).
+const MAX_BATCH_BYTES: usize = 256_000;
 /// Engine.IO v4 separates the packets of one HTTP payload with this byte.
 const PAYLOAD_SEPARATOR: u8 = 0x1e;
 
@@ -158,7 +161,7 @@ impl PollingTransport {
         let post = || {
             self.client
                 .post(address.clone())
-                .timeout(POST_TIMEOUT)
+                .timeout(POST_TIMEOUT + Duration::from_secs((body.len() / POST_BYTES_PER_EXTRA_SECOND) as u64))
                 .body(body.clone())
         };
         // A failed connect never reached the server, so one retry cannot

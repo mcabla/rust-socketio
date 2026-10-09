@@ -104,7 +104,7 @@ impl Socket {
             }
             PacketId::Ping => {
                 self.pinged().await;
-                self.emit(Packet::new(PacketId::Pong, Bytes::new())).await?;
+                self.send_pong();
             }
             PacketId::Pong | PacketId::Open => {
                 // this will never happen as the pong and open
@@ -195,6 +195,33 @@ impl Socket {
         }
 
         Ok(())
+    }
+
+    /// Answers a ping without holding up the reader: on long polling the pong
+    /// goes ahead of waiting messages and the next poll is issued at once. Waiting
+    /// here for the POST meant no poll was open (nothing could arrive) while an
+    /// upload ran, and a slow upload let the server's ping timeout expire.
+    fn send_pong(&self) {
+        let socket = self.clone();
+        self.handle.spawn(async move {
+            let packet = Packet::new(PacketId::Pong, Bytes::new());
+            let lock = socket.transport.lock().await;
+            let queued = match &*lock {
+                AsyncTransportType::Polling(polling) => Some(polling.enqueue_first(packet.clone().into())),
+                _ => None,
+            };
+            drop(lock);
+            let result = match queued {
+                Some(pending) => pending
+                    .await
+                    .map_err(|_| Error::PollingSendFailed("polling writer stopped".to_string()))
+                    .and_then(|result| result.map_err(Error::PollingSendFailed)),
+                None => socket.emit(packet).await,
+            };
+            if let Err(error) = result {
+                socket.call_error_callback(error.to_string());
+            }
+        });
     }
 
     /// Calls the error callback with a given message.

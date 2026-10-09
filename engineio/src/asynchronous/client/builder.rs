@@ -180,8 +180,9 @@ impl ClientBuilder {
             self.tls_config,
             self.headers.map(|v| v.try_into().unwrap()),
         );
-
         // SAFETY: handshake function called previously.
+        transport.set_ping_interval(self.handshake.as_ref().unwrap().ping_interval);
+
         Ok(Client::new(InnerSocket::new(
             transport.into(),
             self.handshake.unwrap(),

@@ -9,6 +9,7 @@ use native_tls::TlsConnector;
 use reqwest::{Client, ClientBuilder, Response};
 use std::collections::VecDeque;
 use std::fmt::Debug;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 use std::{pin::Pin, sync::Arc};
 use tokio::sync::{oneshot, RwLock};
@@ -17,17 +18,30 @@ use url::Url;
 use crate::asynchronous::generator::StreamGenerator;
 use crate::{asynchronous::transport::AsyncTransport, error::Result, Error};
 
-/// Longest a long-poll GET may stay open; the server answers well within its
-/// ping interval, so a longer wait means the connection is dead.
-const POLL_TIMEOUT: Duration = Duration::from_secs(75);
+/// A server holds a long-poll GET at most for its ping interval (it then sends a ping), so a
+/// poll still open after the ping interval plus this margin is dead: a dropped connection.
+/// One fresh poll replaces it before the session is given up, instead of waiting for the
+/// full ping deadline (ping interval plus ping timeout).
+const POLL_MARGIN: Duration = Duration::from_secs(5);
+/// Poll timeout until the handshake tells the ping interval (the handshake request itself
+/// is answered at once); with the default 25 s interval it is the same.
+const DEFAULT_POLL_TIMEOUT: Duration = Duration::from_secs(30);
+/// Failed polls in a row (5xx, connection error, timeout) retried before the
+/// stream fails; the socket's ping deadline still bounds the whole.
+const POLL_RETRIES: u8 = 3;
+/// Pause before a retried poll or POST, doubled per attempt.
+const RETRY_PAUSE: Duration = Duration::from_millis(500);
+/// POSTs answered 502/503/504 (a reverse proxy did not deliver them) retried.
+const POST_RETRIES: u8 = 2;
 /// Longest a small POST may take. Sends are serialized (including the pong),
 /// so one hung POST would otherwise block the connection forever.
 const POST_TIMEOUT: Duration = Duration::from_secs(20);
 /// Extra time per byte for large POSTs on a slow uplink (25 kB/s worst case).
 const POST_BYTES_PER_EXTRA_SECOND: usize = 25_000;
-/// Smaller batches keep each POST short, so a pong queued behind one waits
-/// little; well below the server's default maxHttpBufferSize (1e6 bytes).
-const MAX_BATCH_BYTES: usize = 256_000;
+/// Small batches keep each POST short: only one POST may be in flight, so a
+/// pong or another small message waits at most this much upload (about 3 s at 20 kB/s).
+/// A single larger message still goes alone.
+const MAX_BATCH_BYTES: usize = 64_000;
 /// Engine.IO v4 separates the packets of one HTTP payload with this byte.
 const PAYLOAD_SEPARATOR: u8 = 0x1e;
 
@@ -60,6 +74,8 @@ pub struct PollingTransport {
     base_url: Arc<RwLock<Url>>,
     generator: StreamGenerator<Bytes>,
     queue: Arc<std::sync::Mutex<WriteQueue>>,
+    /// Long-poll timeout in milliseconds, from the server's ping interval once known.
+    poll_timeout_ms: Arc<AtomicU64>,
 }
 
 impl PollingTransport {
@@ -88,12 +104,21 @@ impl PollingTransport {
         let mut url = base_url;
         url.query_pairs_mut().append_pair("transport", "polling");
 
+        let poll_timeout_ms = Arc::new(AtomicU64::new(DEFAULT_POLL_TIMEOUT.as_millis() as u64));
         PollingTransport {
             client: client.clone(),
             base_url: Arc::new(RwLock::new(url.clone())),
-            generator: StreamGenerator::new(Self::stream(url, client)),
+            generator: StreamGenerator::new(Self::stream(url, client, poll_timeout_ms.clone())),
             queue: Arc::new(std::sync::Mutex::new(WriteQueue::default())),
+            poll_timeout_ms,
         }
+    }
+
+    /// Long polls follow the server's ping interval (from the handshake), so a server with a
+    /// longer interval is not cut off and a shorter one is noticed sooner.
+    pub(crate) fn set_ping_interval(&self, ping_interval_ms: u64) {
+        let timeout = Duration::from_millis(ping_interval_ms) + POLL_MARGIN;
+        self.poll_timeout_ms.store(timeout.as_millis() as u64, Ordering::Relaxed);
     }
 
     /// Queues one encoded packet without waiting; the returned receiver yields
@@ -113,6 +138,24 @@ impl PollingTransport {
         let start_writer = {
             let mut queue = self.queue.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             queue.pending.push_back((segment, sender));
+            !std::mem::replace(&mut queue.writing, true)
+        };
+        if start_writer {
+            let transport = self.clone();
+            tokio::spawn(async move { transport.write_loop().await });
+        }
+        receiver
+    }
+
+    /// Queues a control packet (the pong) ahead of waiting messages: the server
+    /// drops the connection when a pong waits behind a long upload, while the
+    /// order of a pong relative to messages does not matter to Engine.IO. The
+    /// POST in flight is never interrupted (the server refuses overlapping POSTs).
+    pub(crate) fn enqueue_first(&self, data: Bytes) -> oneshot::Receiver<SendResult> {
+        let (sender, receiver) = oneshot::channel();
+        let start_writer = {
+            let mut queue = self.queue.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            queue.pending.push_front((data, sender));
             !std::mem::replace(&mut queue.writing, true)
         };
         if start_writer {
@@ -164,18 +207,25 @@ impl PollingTransport {
                 .timeout(POST_TIMEOUT + Duration::from_secs((body.len() / POST_BYTES_PER_EXTRA_SECOND) as u64))
                 .body(body.clone())
         };
-        // A failed connect never reached the server, so one retry cannot
-        // deliver the packets twice.
-        let response = match post().send().await {
-            Ok(response) => response,
-            Err(error) if error.is_connect() => post().send().await?,
-            Err(error) => return Err(error.into()),
-        };
-        let status = response.status().as_u16();
-        if status != 200 {
-            return Err(Error::IncompleteHttp(status));
+        // Retried only when the packets cannot have reached the server: the connect failed,
+        // or the proxy answered 502/503/504 itself. A timeout or reset may have delivered
+        // them, and Engine.IO cannot drop duplicates, so those still end the session.
+        let mut attempt = 0u8;
+        loop {
+            let status = match post().send().await {
+                Ok(response) => response.status().as_u16(),
+                Err(error) if error.is_connect() && attempt < POST_RETRIES => 0,
+                Err(error) => return Err(error.into()),
+            };
+            if status == 200 {
+                return Ok(());
+            }
+            if !(status == 0 || matches!(status, 502..=504)) || attempt >= POST_RETRIES {
+                return Err(Error::IncompleteHttp(status));
+            }
+            tokio::time::sleep(RETRY_PAUSE * 2u32.pow(u32::from(attempt))).await;
+            attempt += 1;
         }
-        Ok(())
     }
 
     fn address(mut url: Url) -> Result<Url> {
@@ -185,28 +235,43 @@ impl PollingTransport {
         Ok(url)
     }
 
-    fn send_request(url: Url, client: Client) -> impl Stream<Item = Result<Response>> {
-        try_stream! {
-            let address = Self::address(url);
-
-            yield client
-                .get(address?)
-                .timeout(POLL_TIMEOUT)
-                .send().await?
-        }
-    }
-
     fn stream(
         url: Url,
         client: Client,
+        poll_timeout_ms: Arc<AtomicU64>,
     ) -> Pin<Box<dyn Stream<Item = Result<Bytes>> + 'static + Send>> {
         Box::pin(try_stream! {
+            let mut failed_polls = 0u8;
             loop {
-                for await elem in Self::send_request(url.clone(), client.clone()) {
-                    for await bytes in elem?.bytes_stream() {
-                        yield bytes?;
+                let address = Self::address(url.clone())?;
+                let response: std::result::Result<Response, reqwest::Error> =
+                    client
+                        .get(address)
+                        .timeout(Duration::from_millis(poll_timeout_ms.load(Ordering::Relaxed)))
+                        .send()
+                        .await;
+                // A failed poll did not reach the server, or its answer was lost (the server then
+                // has no poll open either), so a fresh poll does not overlap. A 4xx (an unknown
+                // session, a refused request) is final; so is a failure that keeps repeating.
+                let failure = match response {
+                    Ok(response) if response.status().is_success() => {
+                        failed_polls = 0;
+                        for await bytes in response.bytes_stream() {
+                            yield bytes?;
+                        }
+                        continue;
                     }
+                    Ok(response) if response.status().is_server_error() => {
+                        Error::IncompleteHttp(response.status().as_u16())
+                    }
+                    Ok(response) => Err(Error::IncompleteHttp(response.status().as_u16()))?,
+                    Err(error) => error.into(),
+                };
+                if failed_polls >= POLL_RETRIES {
+                    Err(failure)?;
                 }
+                tokio::time::sleep(RETRY_PAUSE * 2u32.pow(u32::from(failed_polls))).await;
+                failed_polls += 1;
             }
         })
     }

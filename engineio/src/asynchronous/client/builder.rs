@@ -181,7 +181,8 @@ impl ClientBuilder {
             self.headers.map(|v| v.try_into().unwrap()),
         );
         // SAFETY: handshake function called previously.
-        transport.set_ping_interval(self.handshake.as_ref().unwrap().ping_interval);
+        let handshake = self.handshake.as_ref().unwrap();
+        transport.set_heartbeat_timeout(handshake.ping_interval, handshake.ping_timeout);
 
         Ok(Client::new(InnerSocket::new(
             transport.into(),

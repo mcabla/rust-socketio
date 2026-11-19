@@ -18,13 +18,12 @@ use url::Url;
 use crate::asynchronous::generator::StreamGenerator;
 use crate::{asynchronous::transport::AsyncTransport, error::Result, Error};
 
-/// A server holds a long-poll GET at most for its ping interval (it then sends a ping), so a
-/// poll still open after the ping interval plus this margin is dead: a dropped connection.
-/// One fresh poll replaces it before the session is given up, instead of waiting for the
-/// full ping deadline (ping interval plus ping timeout).
+/// Leave the socket's heartbeat deadline in charge of detecting a dead connection.
+/// The server schedules the next ping after receiving the pong, so a poll can last
+/// the ping interval plus a delayed pong round trip. Aborting it after the interval
+/// alone can produce an overlapping replacement GET and destroy a healthy session.
 const POLL_MARGIN: Duration = Duration::from_secs(5);
-/// Poll timeout until the handshake tells the ping interval (the handshake request itself
-/// is answered at once); with the default 25 s interval it is the same.
+/// Bound the opening request until the handshake supplies the full heartbeat window.
 const DEFAULT_POLL_TIMEOUT: Duration = Duration::from_secs(30);
 /// Failed polls in a row (5xx, connection error, timeout) retried before the
 /// stream fails; the socket's ping deadline still bounds the whole.
@@ -74,7 +73,7 @@ pub struct PollingTransport {
     base_url: Arc<RwLock<Url>>,
     generator: StreamGenerator<Bytes>,
     queue: Arc<std::sync::Mutex<WriteQueue>>,
-    /// Long-poll timeout in milliseconds, from the server's ping interval once known.
+    /// Request timeout in milliseconds, beyond the socket's full heartbeat window.
     poll_timeout_ms: Arc<AtomicU64>,
 }
 
@@ -114,11 +113,14 @@ impl PollingTransport {
         }
     }
 
-    /// Long polls follow the server's ping interval (from the handshake), so a server with a
-    /// longer interval is not cut off and a shorter one is noticed sooner.
-    pub(crate) fn set_ping_interval(&self, ping_interval_ms: u64) {
-        let timeout = Duration::from_millis(ping_interval_ms) + POLL_MARGIN;
-        self.poll_timeout_ms.store(timeout.as_millis() as u64, Ordering::Relaxed);
+    /// A delayed pong may legitimately postpone the next ping. The socket still
+    /// expires an unanswered heartbeat at interval + timeout; the HTTP request
+    /// must not abort a healthy poll and retry while the server still holds it.
+    pub(crate) fn set_heartbeat_timeout(&self, ping_interval_ms: u64, ping_timeout_ms: u64) {
+        let timeout_ms = ping_interval_ms
+            .saturating_add(ping_timeout_ms)
+            .saturating_add(POLL_MARGIN.as_millis() as u64);
+        self.poll_timeout_ms.store(timeout_ms, Ordering::Relaxed);
     }
 
     /// Queues one encoded packet without waiting; the returned receiver yields
@@ -250,9 +252,10 @@ impl PollingTransport {
                         .timeout(Duration::from_millis(poll_timeout_ms.load(Ordering::Relaxed)))
                         .send()
                         .await;
-                // A failed poll did not reach the server, or its answer was lost (the server then
-                // has no poll open either), so a fresh poll does not overlap. A 4xx (an unknown
-                // session, a refused request) is final; so is a failure that keeps repeating.
+                // Retry connection/server failures within the socket's heartbeat budget.
+                // The request deadline extends beyond that budget so a delayed pong cannot
+                // abort a healthy held poll. A 4xx (unknown session/refused request) is final;
+                // so is a failure that keeps repeating.
                 let failure = match response {
                     Ok(response) if response.status().is_success() => {
                         failed_polls = 0;
@@ -329,6 +332,61 @@ mod test {
 
     use super::*;
     use std::str::FromStr;
+    use std::sync::atomic::AtomicUsize;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn polling_waits_for_delayed_pong_without_overlapping_gets() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let requests = Arc::new(AtomicUsize::new(0));
+        let server = tokio::spawn({
+            let requests = Arc::clone(&requests);
+            async move {
+                loop {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    let requests = Arc::clone(&requests);
+                    tokio::spawn(async move {
+                        let mut request = Vec::new();
+                        let mut chunk = [0u8; 1024];
+                        while request.len() < 4096 {
+                            let size = socket.read(&mut chunk).await.unwrap();
+                            if size == 0 {
+                                return;
+                            }
+                            request.extend_from_slice(&chunk[..size]);
+                            if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                                break;
+                            }
+                        }
+                        let first = requests.fetch_add(1, Ordering::Relaxed) == 0;
+                        let reply = if first {
+                            // A six-second pong round trip plus a one-second
+                            // ping interval fits the negotiated eight-second
+                            // heartbeat budget. The old interval + five-second
+                            // poll timeout aborted it and sent another GET.
+                            tokio::time::sleep(Duration::from_secs(7)).await;
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\nConnection: close\r\n\r\n2".as_slice()
+                        } else {
+                            b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".as_slice()
+                        };
+                        let _ = socket.write_all(reply).await;
+                    });
+                }
+            }
+        });
+        let mut transport = PollingTransport::new(
+            Url::parse(&format!("http://{address}/socket.io/")).unwrap(),
+            None,
+            None,
+        );
+        transport.set_heartbeat_timeout(1000, 7000);
+        let response = tokio::time::timeout(Duration::from_secs(10), transport.next()).await;
+        server.abort();
+        let body = response.unwrap().unwrap().unwrap();
+        assert_eq!(body.as_ref(), b"2");
+        assert_eq!(requests.load(Ordering::Relaxed), 1);
+    }
 
     #[tokio::test]
     async fn polling_transport_base_url() -> Result<()> {

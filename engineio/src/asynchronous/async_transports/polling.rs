@@ -259,9 +259,12 @@ impl PollingTransport {
                 let failure = match response {
                     Ok(response) if response.status().is_success() => {
                         failed_polls = 0;
-                        for await bytes in response.bytes_stream() {
-                            yield bytes?;
-                        }
+                        // One HTTP response is one Engine.IO payload. TCP/TLS
+                        // and HTTP chunks can split a packet, a separator or a
+                        // UTF-8 character at any byte; none is a packet boundary.
+                        // Keep the request's existing deadline in force while
+                        // collecting, and never deliver an incomplete prefix.
+                        yield response.bytes().await?;
                         continue;
                     }
                     Ok(response) if response.status().is_server_error() => {
@@ -334,6 +337,106 @@ mod test {
     use std::str::FromStr;
     use std::sync::atomic::AtomicUsize;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// A real HTTP peer with writes separated in time, so response framing is
+    /// exercised instead of depending on how loopback happens to coalesce data.
+    async fn fragmented_poll(
+        fragments: Vec<Vec<u8>>,
+        chunked: bool,
+        truncate: bool,
+    ) -> Result<Bytes> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let length = fragments.iter().map(Vec::len).sum::<usize>();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0u8; 1024];
+            while request.len() < 4096 {
+                let size = socket.read(&mut buffer).await.unwrap();
+                assert_ne!(size, 0);
+                request.extend_from_slice(&buffer[..size]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let framing = if chunked {
+                "Transfer-Encoding: chunked".to_owned()
+            } else {
+                format!("Content-Length: {}", length + usize::from(truncate))
+            };
+            let headers = format!(
+                "HTTP/1.1 200 OK\r\n{framing}\r\nContent-Type: text/plain; charset=UTF-8\r\nConnection: close\r\n\r\n"
+            );
+            socket.write_all(headers.as_bytes()).await.unwrap();
+            for fragment in fragments {
+                if chunked {
+                    socket
+                        .write_all(format!("{:x}\r\n", fragment.len()).as_bytes())
+                        .await
+                        .unwrap();
+                }
+                socket.write_all(&fragment).await.unwrap();
+                if chunked {
+                    socket.write_all(b"\r\n").await.unwrap();
+                }
+                socket.flush().await.unwrap();
+                tokio::time::sleep(Duration::from_millis(30)).await;
+            }
+            if chunked && !truncate {
+                socket.write_all(b"0\r\n\r\n").await.unwrap();
+            }
+            socket.shutdown().await.unwrap();
+        });
+        let mut transport = PollingTransport::new(
+            Url::parse(&format!("http://{address}/socket.io/")).unwrap(),
+            None,
+            None,
+        );
+        let result = tokio::time::timeout(Duration::from_secs(3), transport.next())
+            .await
+            .unwrap()
+            .unwrap();
+        server.await.unwrap();
+        result
+    }
+
+    #[tokio::test]
+    async fn polling_reassembles_content_length_payload_across_utf8_and_json_boundaries() {
+        let body = format!("42[\"notice\",{{\"label\":\"café 🌊\",\"text\":\"{}\"}}]", "x".repeat(24000));
+        let split = body.find('é').unwrap() + 1;
+        let bytes = body.as_bytes();
+        let fragments = vec![
+            bytes[..split].to_vec(),
+            bytes[split..16384].to_vec(),
+            bytes[16384..].to_vec(),
+        ];
+        let actual = fragmented_poll(fragments, false, false).await.unwrap();
+        assert_eq!(actual.as_ref(), bytes);
+        assert_eq!(crate::packet::Payload::try_from(actual).unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn polling_reassembles_chunked_payload_with_multiple_packets_and_binary() {
+        let fragments = vec![
+            b"2\x1e4hel".to_vec(),
+            b"lo\x1e".to_vec(),
+            b"bSGVs".to_vec(),
+            b"bG8=".to_vec(),
+        ];
+        let expected = fragments.concat();
+        let actual = fragmented_poll(fragments, true, false).await.unwrap();
+        assert_eq!(actual.as_ref(), expected.as_slice());
+        assert_eq!(crate::packet::Payload::try_from(actual).unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn polling_rejects_truncated_body_without_yielding_its_prefix() {
+        for chunked in [false, true] {
+            let result = fragmented_poll(vec![b"4partial".to_vec()], chunked, true).await;
+            assert!(matches!(result, Err(Error::IncompleteResponseFromReqwest(_))));
+        }
+    }
 
     #[tokio::test]
     async fn polling_waits_for_delayed_pong_without_overlapping_gets() {
